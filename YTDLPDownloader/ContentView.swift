@@ -23,12 +23,12 @@ struct ContentView: View {
     @State private var customFilename = ""
     @State private var useCustomFilename = false
     @State private var showSettings = false
+    @State private var lastDownloadedFolderURL: URL? = nil
     @AppStorage("ytdlpPath") private var ytdlpPath = "/opt/homebrew/bin/yt-dlp"
     @AppStorage("ffmpegPath") private var ffmpegPath = "/opt/homebrew/bin/ffmpeg"
 
     var body: some View {
         VStack(spacing: 0) {
-            // Main Content
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
                     // Header
@@ -65,9 +65,7 @@ struct ContentView: View {
                                     TextField("Path to yt-dlp", text: $ytdlpPath)
                                         .textFieldStyle(.roundedBorder)
                                         .font(.system(.body, design: .monospaced))
-                                    Button("Auto-detect") {
-                                        autoDetectYTDLP()
-                                    }
+                                    Button("Auto-detect") { autoDetectYTDLP() }
                                 }
                                 Text("Common locations: /opt/homebrew/bin/yt-dlp, /usr/local/bin/yt-dlp")
                                     .font(.caption)
@@ -84,9 +82,7 @@ struct ContentView: View {
                                     TextField("Path to ffmpeg", text: $ffmpegPath)
                                         .textFieldStyle(.roundedBorder)
                                         .font(.system(.body, design: .monospaced))
-                                    Button("Auto-detect") {
-                                        autoDetectFFmpeg()
-                                    }
+                                    Button("Auto-detect") { autoDetectFFmpeg() }
                                 }
                                 Text("Common locations: /opt/homebrew/bin/ffmpeg, /usr/local/bin/ffmpeg")
                                     .font(.caption)
@@ -107,9 +103,7 @@ struct ContentView: View {
                         TextField("Enter YouTube or other video URL", text: $urlInput)
                             .textFieldStyle(.roundedBorder)
                             .onSubmit {
-                                if !urlInput.isEmpty {
-                                    startDownload()
-                                }
+                                if !urlInput.isEmpty { startDownload() }
                             }
                         Text("Supports YouTube, Vimeo, Twitter, and 1000+ sites")
                             .font(.caption)
@@ -153,9 +147,7 @@ struct ContentView: View {
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .background(Color(nsColor: .controlBackgroundColor))
                                 .cornerRadius(6)
-                            Button("Choose…") {
-                                showFilePicker = true
-                            }
+                            Button("Choose…") { showFilePicker = true }
                         }
                     }
 
@@ -183,7 +175,7 @@ struct ContentView: View {
                     }
                     .disabled(urlInput.isEmpty && !downloadManager.isDownloading)
 
-                    // Progress
+                    // Progress + Show in Finder
                     if downloadManager.isDownloading || !downloadManager.lastStatus.isEmpty {
                         VStack(alignment: .leading, spacing: 8) {
                             HStack {
@@ -197,11 +189,26 @@ struct ContentView: View {
                             }
                             Text(downloadManager.lastStatus)
                                 .font(.system(.body, design: .monospaced))
-                                .foregroundColor(downloadManager.isDownloading ? .primary : (downloadManager.lastStatus.hasPrefix("✓") ? .green : .red))
+                                .foregroundColor(
+                                    downloadManager.isDownloading ? .primary :
+                                        (downloadManager.lastStatus.hasPrefix("✓") ? .green : .red)
+                                )
                                 .padding(8)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .background(Color(nsColor: .controlBackgroundColor))
                                 .cornerRadius(6)
+
+                            // Show in Finder — appears only after a successful download
+                            if let folderURL = lastDownloadedFolderURL,
+                               downloadManager.lastStatus.hasPrefix("✓") {
+                                Button {
+                                    NSWorkspace.shared.activateFileViewerSelecting([folderURL])
+                                } label: {
+                                    Label("Show in Finder", systemImage: "folder")
+                                        .font(.subheadline)
+                                }
+                                .buttonStyle(.link)
+                            }
                         }
                     }
 
@@ -217,7 +224,7 @@ struct ContentView: View {
                                         .frame(maxWidth: .infinity, alignment: .leading)
                                         .padding(8)
                                         .id("console")
-                                        .onChange(of: downloadManager.consoleOutput) { _,_ in
+                                        .onChange(of: downloadManager.consoleOutput) { _, _ in
                                             proxy.scrollTo("console", anchor: .bottom)
                                         }
                                 }
@@ -248,6 +255,37 @@ struct ContentView: View {
         }
     }
 
+    // MARK: - Actions
+
+    func startDownload() {
+        if downloadManager.isDownloading {
+            downloadManager.cancelDownload()
+            return
+        }
+        guard !urlInput.isEmpty else { return }
+
+        lastDownloadedFolderURL = nil  // Clear previous result
+
+        var options = DownloadOptions(
+            url: urlInput,
+            format: selectedFormat,
+            destination: destinationPath,
+            embedThumbnail: embedThumbnail,
+            embedMetadata: embedMetadata,
+            ytdlpPath: ytdlpPath,
+            ffmpegPath: ffmpegPath
+        )
+        if useCustomFilename && !customFilename.isEmpty {
+            options.customFilename = customFilename
+        }
+
+        downloadManager.onDownloadCompleted = { [self] folderURL in
+            lastDownloadedFolderURL = folderURL
+        }
+
+        downloadManager.startDownload(options: options)
+    }
+
     func autoDetectFFmpeg() {
         let commonPaths = [
             "/opt/homebrew/bin/ffmpeg",
@@ -256,7 +294,6 @@ struct ContentView: View {
             NSHomeDirectory() + "/.local/bin/ffmpeg",
             "/usr/bin/ffmpeg"
         ]
-
         for path in commonPaths {
             if FileManager.default.fileExists(atPath: path) {
                 ffmpegPath = path
@@ -265,19 +302,14 @@ struct ContentView: View {
                 return
             }
         }
-
-        // Try using 'which' command
         let task = Process()
         task.launchPath = "/usr/bin/which"
         task.arguments = ["ffmpeg"]
-
         let pipe = Pipe()
         task.standardOutput = pipe
-
         do {
             try task.run()
             task.waitUntilExit()
-
             if task.terminationStatus == 0 {
                 let data = pipe.fileHandleForReading.readDataToEndOfFile()
                 if let path = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines), !path.isEmpty {
@@ -288,8 +320,7 @@ struct ContentView: View {
                 }
             }
         } catch {}
-
-        alertMessage = "Could not auto-detect ffmpeg.\n\nPlease enter the path manually or install with:\nbrew install ffmpeg"
+        alertMessage = "Could not auto-detect ffmpeg.\n\nInstall with:\nbrew install ffmpeg"
         showAlert = true
     }
 
@@ -301,7 +332,6 @@ struct ContentView: View {
             NSHomeDirectory() + "/.local/bin/yt-dlp",
             "/usr/bin/yt-dlp"
         ]
-
         for path in commonPaths {
             if FileManager.default.fileExists(atPath: path) {
                 ytdlpPath = path
@@ -310,19 +340,14 @@ struct ContentView: View {
                 return
             }
         }
-
-        // Try using 'which' command
         let task = Process()
         task.launchPath = "/usr/bin/which"
         task.arguments = ["yt-dlp"]
-
         let pipe = Pipe()
         task.standardOutput = pipe
-
         do {
             try task.run()
             task.waitUntilExit()
-
             if task.terminationStatus == 0 {
                 let data = pipe.fileHandleForReading.readDataToEndOfFile()
                 if let path = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines), !path.isEmpty {
@@ -333,97 +358,63 @@ struct ContentView: View {
                 }
             }
         } catch {}
-
-        alertMessage = "Could not auto-detect yt-dlp.\n\nPlease enter the path manually or install with:\nbrew install yt-dlp"
+        alertMessage = "Could not auto-detect yt-dlp.\n\nInstall with:\nbrew install yt-dlp"
         showAlert = true
     }
 
     func checkYTDLP() {
-        // First verify the file exists
         let fileManager = FileManager.default
         guard fileManager.fileExists(atPath: ytdlpPath) else {
-            alertMessage = "yt-dlp not found at:\n\(ytdlpPath)\n\nThe file does not exist. Click 'Auto-detect' to find it, or check that yt-dlp is installed:\n\nbrew install yt-dlp"
+            alertMessage = "yt-dlp not found at:\n\(ytdlpPath)\n\nbrew install yt-dlp"
             showAlert = true
             return
         }
-
-        // Check if file is executable
         guard fileManager.isExecutableFile(atPath: ytdlpPath) else {
-            alertMessage = "yt-dlp found but not executable:\n\(ytdlpPath)\n\nRun in Terminal:\nchmod +x \(ytdlpPath)"
+            alertMessage = "yt-dlp not executable:\n\(ytdlpPath)\n\nchmod +x \(ytdlpPath)"
             showAlert = true
             return
         }
-
         let task = Process()
         task.executableURL = URL(fileURLWithPath: ytdlpPath)
         task.arguments = ["--version"]
-
         let pipe = Pipe()
         task.standardOutput = pipe
         task.standardError = pipe
-
         do {
             try task.run()
             task.waitUntilExit()
-
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
             if task.terminationStatus == 0 {
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
                 let version = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "unknown"
-                alertMessage = "✓ yt-dlp is working!\n\nPath: \(ytdlpPath)\nVersion: \(version)\n\nTo update, run in Terminal:\nbrew upgrade yt-dlp\n\nor:\npip install -U yt-dlp"
+                alertMessage = "✓ yt-dlp is working!\n\nPath: \(ytdlpPath)\nVersion: \(version)"
             } else {
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
                 let error = String(data: data, encoding: .utf8) ?? "Unknown error"
-                alertMessage = "yt-dlp error:\n\(error)\n\nPath: \(ytdlpPath)"
+                alertMessage = "yt-dlp error:\n\(error)"
             }
         } catch {
-            alertMessage = "Error running yt-dlp:\n\(error.localizedDescription)\n\nPath: \(ytdlpPath)\n\nTry disabling App Sandbox in Xcode:\nSigning & Capabilities → Remove App Sandbox"
+            alertMessage = "Error running yt-dlp:\n\(error.localizedDescription)\n\nIf sandbox is enabled, remove it in:\nSigning & Capabilities → App Sandbox"
         }
         showAlert = true
     }
-
-    func startDownload() {
-        if downloadManager.isDownloading {
-            downloadManager.cancelDownload()
-            return
-        }
-
-        guard !urlInput.isEmpty else { return }
-
-        var options = DownloadOptions(
-            url: urlInput,
-            format: selectedFormat,
-            destination: destinationPath,
-            embedThumbnail: embedThumbnail,
-            embedMetadata: embedMetadata,
-            ytdlpPath: ytdlpPath,
-            ffmpegPath: ffmpegPath
-        )
-
-        if useCustomFilename && !customFilename.isEmpty {
-            options.customFilename = customFilename
-        }
-
-        downloadManager.startDownload(options: options)
-    }
 }
+
+// MARK: - Models
 
 enum DownloadFormat {
     case mp4Best, mp41080p, mp4720p, mp4480p, mp3, m4a
 
     var ytdlpFormat: String {
         switch self {
-        case .mp4Best: return "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b"
+        case .mp4Best:  return "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b"
         case .mp41080p: return "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/bv*[height<=1080]+ba/b[height<=1080]"
-        case .mp4720p: return "bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720][ext=mp4]/bv*[height<=720]+ba/b[height<=720]"
-        case .mp4480p: return "bv*[height<=480][ext=mp4]+ba[ext=m4a]/b[height<=480][ext=mp4]/bv*[height<=480]+ba/b[height<=480]"
-        case .mp3: return "ba/b"
-        case .m4a: return "ba[ext=m4a]/ba/b"
+        case .mp4720p:  return "bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720][ext=mp4]/bv*[height<=720]+ba/b[height<=720]"
+        case .mp4480p:  return "bv*[height<=480][ext=mp4]+ba[ext=m4a]/b[height<=480][ext=mp4]/bv*[height<=480]+ba/b[height<=480]"
+        case .mp3:      return "ba/b"
+        case .m4a:      return "ba[ext=m4a]/ba/b"
         }
     }
 
-    var isAudioOnly: Bool {
-        self == .mp3 || self == .m4a
-    }
+    var isAudioOnly: Bool { self == .mp3 || self == .m4a }
 }
 
 struct DownloadOptions {
@@ -437,36 +428,36 @@ struct DownloadOptions {
     var customFilename: String?
 }
 
+// MARK: - DownloadManager
+
 class DownloadManager: ObservableObject {
     @Published var isDownloading = false
     @Published var lastStatus = ""
     @Published var consoleOutput = ""
 
+    var onDownloadCompleted: ((URL) -> Void)?
+
     private var currentTask: Process?
+    private var destinationFolder: String = ""
 
     func startDownload(options: DownloadOptions) {
         isDownloading = true
         lastStatus = "Starting download…"
         consoleOutput = ""
+        destinationFolder = options.destination
 
         let task = Process()
         task.executableURL = URL(fileURLWithPath: options.ytdlpPath)
 
         var args: [String] = []
 
-        // Specify ffmpeg location
         args.append(contentsOf: ["--ffmpeg-location", options.ffmpegPath])
-
-        // Format - use simpler selectors with better fallbacks
         args.append(contentsOf: ["-f", options.format.ytdlpFormat])
 
-        // Merge formats into single file (only for video downloads)
         if !options.format.isAudioOnly {
-            args.append("--merge-output-format")
-            args.append("mp4")
+            args.append(contentsOf: ["--merge-output-format", "mp4"])
         }
 
-        // Audio extraction for audio-only formats
         if options.format.isAudioOnly {
             if options.format == .mp3 {
                 args.append(contentsOf: ["-x", "--audio-format", "mp3", "--audio-quality", "0"])
@@ -475,17 +466,9 @@ class DownloadManager: ObservableObject {
             }
         }
 
-        // Thumbnail
-        if options.embedThumbnail {
-            args.append("--embed-thumbnail")
-        }
+        if options.embedThumbnail { args.append("--embed-thumbnail") }
+        if options.embedMetadata  { args.append("--embed-metadata") }
 
-        // Metadata
-        if options.embedMetadata {
-            args.append("--embed-metadata")
-        }
-
-        // Output template
         var outputTemplate = "\(options.destination)/"
         if let customName = options.customFilename, !customName.isEmpty {
             outputTemplate += "\(customName).%(ext)s"
@@ -494,13 +477,7 @@ class DownloadManager: ObservableObject {
         }
         args.append(contentsOf: ["-o", outputTemplate])
 
-        // Progress and other options
-        args.append(contentsOf: [
-            "--newline",
-            "--no-warnings",
-            "--progress",
-            options.url
-        ])
+        args.append(contentsOf: ["--newline", "--no-warnings", "--progress", options.url])
 
         task.arguments = args
 
@@ -523,6 +500,9 @@ class DownloadManager: ObservableObject {
                 self?.isDownloading = false
                 if task.terminationStatus == 0 {
                     self?.lastStatus = "✓ Download completed successfully!"
+                    if let folder = self?.destinationFolder {
+                        self?.onDownloadCompleted?(URL(fileURLWithPath: folder))
+                    }
                 } else if task.terminationReason == .exit && task.terminationStatus == 15 {
                     self?.lastStatus = "Download cancelled"
                 } else {
@@ -556,21 +536,15 @@ class DownloadManager: ObservableObject {
                 } else if line.contains("100%") {
                     lastStatus = "Processing…"
                 } else if line.contains("%") {
-                    // Extract percentage
-                    let components = line.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
-                    if let percentIndex = components.firstIndex(where: { $0.hasSuffix("%") }) {
-                        lastStatus = "Downloading: \(components[percentIndex])"
+                    let parts = line.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
+                    if let i = parts.firstIndex(where: { $0.hasSuffix("%") }) {
+                        lastStatus = "Downloading: \(parts[i])"
                     }
                 }
-            } else if line.contains("[ExtractAudio]") {
-                lastStatus = "Extracting audio…"
-            } else if line.contains("[EmbedThumbnail]") {
-                lastStatus = "Embedding thumbnail…"
-            } else if line.contains("[Metadata]") {
-                lastStatus = "Adding metadata…"
-            } else if line.contains("ERROR") {
-                lastStatus = "Error: \(line)"
-            }
+            } else if line.contains("[ExtractAudio]")  { lastStatus = "Extracting audio…" }
+            else if line.contains("[EmbedThumbnail]") { lastStatus = "Embedding thumbnail…" }
+            else if line.contains("[Metadata]")       { lastStatus = "Adding metadata…" }
+            else if line.contains("ERROR")            { lastStatus = "Error: \(line)" }
         }
     }
 }
