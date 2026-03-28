@@ -24,6 +24,11 @@ struct ContentView: View {
     @State private var useCustomFilename = false
     @State private var showSettings = false
     @State private var lastDownloadedFolderURL: URL? = nil
+    @State private var showYTDLPSheet = false
+    @State private var ytdlpSheetMessage = ""
+    @State private var isUpdating = false
+    @State private var updateOutput = ""
+    @State private var detectedInstallMethod: String? = nil
     @AppStorage("ytdlpPath") private var ytdlpPath = "/opt/homebrew/bin/yt-dlp"
     @AppStorage("ffmpegPath") private var ffmpegPath = "/opt/homebrew/bin/ffmpeg"
 
@@ -44,7 +49,7 @@ struct ContentView: View {
                                 .font(.system(size: 18))
                         }
                         Button(action: { checkYTDLP() }) {
-                            Label("Check yt-dlp", systemImage: "checkmark.circle")
+                            Label("Update yt-dlp", systemImage: "checkmark.circle")
                         }
                     }
                     .padding(.bottom, 5)
@@ -253,6 +258,16 @@ struct ContentView: View {
         } message: {
             Text(alertMessage)
         }
+        .sheet(isPresented: $showYTDLPSheet) {
+            YTDLPSheet(
+                checkMessage: ytdlpSheetMessage,
+                detectedInstallMethod: detectedInstallMethod,
+                isUpdating: $isUpdating,
+                updateOutput: $updateOutput,
+                onUpdate: { method in runUpdate(method: method) },
+                onDismiss: { showYTDLPSheet = false }
+            )
+        }
     }
 
     // MARK: - Actions
@@ -363,15 +378,16 @@ struct ContentView: View {
     }
 
     func checkYTDLP() {
+        updateOutput = ""
         let fileManager = FileManager.default
         guard fileManager.fileExists(atPath: ytdlpPath) else {
-            alertMessage = "yt-dlp not found at:\n\(ytdlpPath)\n\nbrew install yt-dlp"
-            showAlert = true
+            ytdlpSheetMessage = "✗ yt-dlp not found at:\n\(ytdlpPath)\n\nInstall with: brew install yt-dlp"
+            showYTDLPSheet = true
             return
         }
         guard fileManager.isExecutableFile(atPath: ytdlpPath) else {
-            alertMessage = "yt-dlp not executable:\n\(ytdlpPath)\n\nchmod +x \(ytdlpPath)"
-            showAlert = true
+            ytdlpSheetMessage = "✗ yt-dlp not executable at:\n\(ytdlpPath)\n\nRun: chmod +x \(ytdlpPath)"
+            showYTDLPSheet = true
             return
         }
         let task = Process()
@@ -386,15 +402,120 @@ struct ContentView: View {
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
             if task.terminationStatus == 0 {
                 let version = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "unknown"
-                alertMessage = "✓ yt-dlp is working!\n\nPath: \(ytdlpPath)\nVersion: \(version)"
+                ytdlpSheetMessage = "✓ yt-dlp is working!\n\nPath: \(ytdlpPath)\nVersion: \(version)"
             } else {
                 let error = String(data: data, encoding: .utf8) ?? "Unknown error"
-                alertMessage = "yt-dlp error:\n\(error)"
+                ytdlpSheetMessage = "✗ yt-dlp error:\n\(error)"
             }
         } catch {
-            alertMessage = "Error running yt-dlp:\n\(error.localizedDescription)\n\nIf sandbox is enabled, remove it in:\nSigning & Capabilities → App Sandbox"
+            ytdlpSheetMessage = "✗ Error running yt-dlp:\n\(error.localizedDescription)\n\nIf sandbox is enabled, remove it in:\nSigning & Capabilities → App Sandbox"
         }
-        showAlert = true
+        detectedInstallMethod = detectInstallMethod()
+        showYTDLPSheet = true
+    }
+
+    func detectInstallMethod() -> String? {
+        let path = ytdlpPath
+
+        // Path-based heuristics — fast, no subprocess
+        if path.contains("/homebrew/") || path.contains("/Cellar/") || path.contains("/linuxbrew/") {
+            return "Homebrew"
+        }
+        if path.contains("/pipx/") {
+            return "pipx"
+        }
+        if path.lowercased().contains("conda") || path.lowercased().contains("miniconda") || path.lowercased().contains("anaconda") {
+            return "conda"
+        }
+
+        // Fall back to querying package managers
+        let candidates: [(method: String, check: String)] = [
+            ("pip3",     "pip3 show yt-dlp"),
+            ("pip",      "pip show yt-dlp"),
+            ("Homebrew", "brew list yt-dlp"),
+            ("pipx",     "pipx list 2>/dev/null | grep -q yt-dlp"),
+            ("conda",    "conda list 2>/dev/null | grep -q yt-dlp")
+        ]
+        let shell = "/bin/sh"
+        let pathEnv = "export PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:$PATH; "
+        for candidate in candidates {
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: shell)
+            task.arguments = ["-c", pathEnv + candidate.check + " >/dev/null 2>&1"]
+            task.standardOutput = FileHandle.nullDevice
+            task.standardError = FileHandle.nullDevice
+            do {
+                try task.run()
+                task.waitUntilExit()
+                if task.terminationStatus == 0 { return candidate.method }
+            } catch {}
+        }
+        return nil
+    }
+
+    func runUpdate(method: String) {
+        let commands: [String: String] = [
+            "pip":      "pip install -U yt-dlp",
+            "pip3":     "pip3 install -U yt-dlp",
+            "Homebrew": "brew upgrade yt-dlp",
+            "pipx":     "pipx upgrade yt-dlp",
+            "conda":    "conda update -y yt-dlp"
+        ]
+        guard let cmd = commands[method] else { return }
+
+        isUpdating = true
+        updateOutput = "$ \(cmd)\n"
+
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/sh")
+        task.arguments = ["-c", "export PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:$PATH; \(cmd) 2>&1"]
+
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = pipe
+
+        pipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            if !data.isEmpty, let output = String(data: data, encoding: .utf8) {
+                DispatchQueue.main.async { self.updateOutput += output }
+            }
+        }
+
+        task.terminationHandler = { task in
+            DispatchQueue.main.async {
+                self.isUpdating = false
+                if task.terminationStatus == 0 {
+                    self.updateOutput += "\n✓ Update completed!"
+                    self.recheckVersion()
+                } else {
+                    self.updateOutput += "\n✗ Update failed (exit code: \(task.terminationStatus))"
+                }
+            }
+        }
+
+        do { try task.run() } catch {
+            isUpdating = false
+            updateOutput += "Error: \(error.localizedDescription)"
+        }
+    }
+
+    private func recheckVersion() {
+        guard FileManager.default.fileExists(atPath: ytdlpPath) else { return }
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: ytdlpPath)
+        task.arguments = ["--version"]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = pipe
+        do {
+            try task.run()
+            task.waitUntilExit()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            if task.terminationStatus == 0,
+               let version = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) {
+                ytdlpSheetMessage = "✓ yt-dlp is working!\n\nPath: \(ytdlpPath)\nVersion: \(version)"
+            }
+        } catch {}
     }
 }
 
@@ -527,7 +648,7 @@ class DownloadManager: ObservableObject {
         currentTask = nil
     }
 
-    private func parseOutput(_ output: String) {
+    func parseOutput(_ output: String) {
         let lines = output.components(separatedBy: .newlines)
         for line in lines {
             if line.contains("[download]") {
@@ -545,6 +666,140 @@ class DownloadManager: ObservableObject {
             else if line.contains("[EmbedThumbnail]") { lastStatus = "Embedding thumbnail…" }
             else if line.contains("[Metadata]")       { lastStatus = "Adding metadata…" }
             else if line.contains("ERROR")            { lastStatus = "Error: \(line)" }
+        }
+    }
+}
+
+// MARK: - YTDLPSheet
+
+struct YTDLPSheet: View {
+    let checkMessage: String
+    let detectedInstallMethod: String?
+    @Binding var isUpdating: Bool
+    @Binding var updateOutput: String
+    let onUpdate: (String) -> Void
+    let onDismiss: () -> Void
+
+    private let updateMethods: [(label: String, subtitle: String)] = [
+        ("pip",      "pip install -U yt-dlp"),
+        ("pip3",     "pip3 install -U yt-dlp"),
+        ("Homebrew", "brew upgrade yt-dlp"),
+        ("pipx",     "pipx upgrade yt-dlp"),
+        ("conda",    "conda update -y yt-dlp")
+    ]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            // Header
+            HStack {
+                Label("yt-dlp Status", systemImage: "checkmark.circle")
+                    .font(.title2.bold())
+                Spacer()
+                Button("Done", action: onDismiss)
+                    .keyboardShortcut(.defaultAction)
+            }
+
+            Divider()
+
+            // Version / status info
+            Text(checkMessage)
+                .font(.system(.body, design: .monospaced))
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(nsColor: .controlBackgroundColor))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+
+            // Update section
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Update yt-dlp")
+                    .font(.headline)
+                if let detected = detectedInstallMethod {
+                    Text("Installed via \(detected) — that button is highlighted below.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("Select the package manager you used to install yt-dlp:")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+
+                LazyVGrid(
+                    columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())],
+                    spacing: 8
+                ) {
+                    ForEach(updateMethods, id: \.label) { method in
+                        let isDetected = method.label == detectedInstallMethod
+                        Button {
+                            onUpdate(method.label)
+                        } label: {
+                            VStack(spacing: 4) {
+                                HStack(spacing: 4) {
+                                    Text(method.label)
+                                        .fontWeight(.semibold)
+                                    if isDetected {
+                                        Image(systemName: "checkmark.circle.fill")
+                                            .font(.caption)
+                                    }
+                                }
+                                Text(method.subtitle)
+                                    .font(.caption)
+                                    .foregroundStyle(isDetected ? .primary : .secondary)
+                                    .lineLimit(1)
+                                    .minimumScaleFactor(0.7)
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 8)
+                        }
+                        .disabled(isUpdating)
+                        .detectedButtonStyle(isDetected)
+                        .accessibilityLabel("Update via \(method.label)\(isDetected ? ", detected install method" : "")")
+                        .accessibilityHint(method.subtitle)
+                    }
+                }
+            }
+
+            // Live output
+            if !updateOutput.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("Output")
+                            .font(.headline)
+                        Spacer()
+                        if isUpdating {
+                            ProgressView()
+                                .scaleEffect(0.7)
+                        }
+                    }
+                    ScrollView {
+                        ScrollViewReader { proxy in
+                            Text(updateOutput)
+                                .font(.system(.caption, design: .monospaced))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(8)
+                                .id("updateOutput")
+                                .onChange(of: updateOutput) { _, _ in
+                                    proxy.scrollTo("updateOutput", anchor: .bottom)
+                                }
+                        }
+                    }
+                    .frame(height: 180)
+                    .background(Color(nsColor: .controlBackgroundColor))
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                }
+            }
+        }
+        .padding(20)
+        .frame(minWidth: 500, minHeight: 320)
+    }
+}
+
+private extension View {
+    @ViewBuilder
+    func detectedButtonStyle(_ detected: Bool) -> some View {
+        if detected {
+            self.buttonStyle(.borderedProminent)
+        } else {
+            self.buttonStyle(.bordered)
         }
     }
 }
